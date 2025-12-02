@@ -1,0 +1,14 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<AppInstaller
+	Uri="file:///C:/Users/NHinken/source/repos/GenerateXInvoices.Package/AppPackages/GenerateXInvoices.Package_1.0.8.0_Debug_Test/GenerateXInvoices.Package.appinstaller"
+	Version="1.0.11.0" xmlns="http://schemas.microsoft.com/appx/appinstaller/2017/2">
+	<MainBundle
+		Name="4d4a9b5f-5802-486f-9aa0-eb9fafac80ca"
+		Version="1.0.11.0"
+		Publisher="CN=nhinken"
+		Uri="file:///C:/Users/NHinken/source/repos/GenerateXInvoices.Package/AppPackages/GenerateXInvoices.Package_1.0.8.0_Debug_Test/GenerateXInvoices.Package_1.0.11.0_Debug_Test/GenerateXInvoices.Package_1.0.11.0_x64_Debug.msixbundle" />
+	<UpdateSettings>
+		<OnLaunch
+			HoursBetweenUpdateChecks="0" />
+	</UpdateSettings>
+</AppInstaller>
