@@ -1,0 +1,13 @@
+<Solution>
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="GenerateXInvoices.Package/GenerateXInvoices.Package.wapproj" Type="c7167f0d-bc9f-4e6e-afe1-012c56b48db5">
+    <Platform Project="x64" />
+    <Deploy />
+  </Project>
+  <Project Path="GenerateXInvoices/GenerateXInvoices.csproj">
+    <Platform Solution="*|x64" Project="x64" />
+  </Project>
+</Solution>
