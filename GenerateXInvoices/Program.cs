@@ -1,4 +1,4 @@
-﻿// <PackageReference Include="Bogus" Version="35.5.0" />
+// <PackageReference Include="Bogus" Version="35.5.0" />
 // <PackageReference Include="Spectre.Console" Version="0.49.1" />
 
 using System.Buffers;
@@ -8,8 +8,9 @@ using System.Globalization;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
-using System.Text.Json.Serialization.Metadata;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using System.Threading.Channels;
 using System.Xml;
 using System.Xml.Linq;
 using Bogus;
@@ -109,6 +110,13 @@ public sealed class LineItem
     {
         get; set;
     } // optional per-line VAT
+}
+
+[JsonSourceGenerationOptions(WriteIndented = true)]
+[JsonSerializable(typeof(GeneratorSettings))]
+[JsonSerializable(typeof(Invoice))]
+internal partial class AppJsonContext : JsonSerializerContext
+{
 }
 
 // ========================= Settings =========================
@@ -276,7 +284,7 @@ public sealed class GeneratorSettings
     {
         WriteIndented = true,
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        TypeInfoResolver = new DefaultJsonTypeInfoResolver()
+        TypeInfoResolver = AppJsonContext.Default
     };
 
     public static GeneratorSettings Load()
@@ -286,13 +294,12 @@ public sealed class GeneratorSettings
             if (File.Exists(SettingsPath))
             {
                 var json = File.ReadAllText(SettingsPath);
-                var settings = JsonSerializer.Deserialize<GeneratorSettings>(json, SerializerOptions);
+                var settings = JsonSerializer.Deserialize(json, AppJsonContext.Default.GeneratorSettings);
                 return settings ?? new GeneratorSettings();
             }
         }
         catch (Exception ex)
         {
-            // Fallback bei Fehler
             AnsiConsole.MarkupLine($"[yellow]Warning: Could not load settings ({ex.Message}). Using defaults.[/]");
         }
 
@@ -309,7 +316,7 @@ public sealed class GeneratorSettings
                 Directory.CreateDirectory(directory);
             }
 
-            var json = JsonSerializer.Serialize(this, SerializerOptions);
+            var json = JsonSerializer.Serialize(this, AppJsonContext.Default.GeneratorSettings);
             File.WriteAllText(SettingsPath, json);
         }
         catch (Exception ex)
@@ -446,10 +453,10 @@ public static class InvoiceJson
     private static readonly JsonSerializerOptions Opts = new()
     {
         WriteIndented = true,
-        TypeInfoResolver = new DefaultJsonTypeInfoResolver()
+        TypeInfoResolver = AppJsonContext.Default
     };
 
-    public static string ToJson(Invoice inv) => JsonSerializer.Serialize(inv, Opts);
+    public static string ToJson(Invoice inv) => JsonSerializer.Serialize(inv, AppJsonContext.Default.Invoice);
 }
 
 // ==================== CSV Export ====================
@@ -724,7 +731,6 @@ internal partial class Program
     // ---------- Generators ----------
     private static void GenerateMultiple()
     {
-        // Professioneller Header
         AnsiConsole.Write(new Rule("[bold cyan]Batch Invoice Generation[/]").LeftJustified());
         AnsiConsole.WriteLine();
 
@@ -747,11 +753,15 @@ internal partial class Program
         var useJson = AnsiConsole.Confirm($"[green]{L.T("Also save JSON sidecar?")}[/]", Settings.SaveJsonSidecar);
         Settings.FixedItemCount = fixedItems;
         Settings.SaveJsonSidecar = useJson;
-        Settings.Save(); // Auto-Save
+        Settings.Save();
 
         AnsiConsole.WriteLine();
 
-        // Optimierung: Vorallokierung von Faker-Instanzen pro Thread (mit Limit)
+        GenerateMultiplePipelineAsync(count, useJson).GetAwaiter().GetResult();
+    }
+
+    private static async Task GenerateMultiplePipelineAsync(int count, bool useJson)
+    {
         var threadCount = Environment.ProcessorCount;
         var targetPoolSize = Math.Min(threadCount * 2, MaxFakerPoolSize);
 
@@ -763,104 +773,156 @@ internal partial class Program
         var progress = 0;
         var errors = 0;
         var sw = Stopwatch.StartNew();
+        var lastUpdateTime = sw.Elapsed;
+        var lastUpdateCount = 0;
 
-        // Optimierung: Größerer Batch für bessere Cache-Locality
-        var batchSize = Math.Max(1, count / (threadCount * 4));
+        // Channel für Pipeline: Producer (Generate) -> Consumer (I/O)
+        // BoundedCapacity verhindert Speicherprobleme bei sehr großen Batches
+        var channelCapacity = Math.Min(count, threadCount * 32);
+        var channel = Channel.CreateBounded<Invoice>(new BoundedChannelOptions(channelCapacity)
+        {
+            SingleReader = false,
+            SingleWriter = false,
+            AllowSynchronousContinuations = false,
+            FullMode = BoundedChannelFullMode.Wait
+        });
 
-        AnsiConsole.Progress()
+        await AnsiConsole.Progress()
             .AutoClear(false)
             .HideCompleted(false)
             .Columns(
             [
                 new TaskDescriptionColumn(),
-                new ProgressBarColumn()
-                {
-                    CompletedStyle = new Style(Color.Cyan1),
-                    RemainingStyle = new Style(Color.Grey23)
-                },
-                new PercentageColumn() { Style = new Style(Color.Cyan1) },
-                new RemainingTimeColumn() { Style = new Style(Color.Yellow) },
-                new SpinnerColumn(Spinner.Known.Dots) { Style = new Style(Color.Cyan1) },
+            new ProgressBarColumn()
+            {
+                CompletedStyle = new Style(Color.Cyan1),
+                RemainingStyle = new Style(Color.Grey23)
+            },
+            new PercentageColumn() { Style = new Style(Color.Cyan1) },
+            new RemainingTimeColumn() { Style = new Style(Color.Yellow) },
+            new SpinnerColumn(Spinner.Known.Dots) { Style = new Style(Color.Cyan1) },
             ])
-            .Start(ctx =>
+            .StartAsync(async ctx =>
             {
                 var task = ctx.AddTask(
                     $"[cyan]{L.T("Generating invoices")}[/]",
                     new ProgressTaskSettings { MaxValue = count }
                 );
 
-                // Optimierung: Partitioner für besseres Work-Stealing
-                var partitioner = Partitioner.Create(0, count, batchSize);
-
-                Parallel.ForEach(partitioner,
-                    new ParallelOptions { MaxDegreeOfParallelism = threadCount },
-                    (range, loopState) =>
+                var producerTask = Task.Run(async () =>
+                {
+                    try
                     {
-                        // Thread-lokaler Faker (verhindert Lock-Contention)
-                        if (!_fakerPool.TryTake(out var faker))
-                        {
-                            faker = InvoiceFakerFactory.Create(SettingsWithThreadSeed(Settings));
-                        }
+                        var batchSize = Math.Max(1, count / (threadCount * 8));
+                        var partitioner = Partitioner.Create(0, count, batchSize);
 
-                        try
-                        {
-                            // Batch-Verarbeitung für bessere Cache-Performance
-                            for (var i = range.Item1; i < range.Item2; i++)
+                        await Parallel.ForEachAsync(
+                            partitioner.GetDynamicPartitions(),
+                            new ParallelOptions { MaxDegreeOfParallelism = threadCount },
+                            async (range, ct) =>
                             {
+                                if (!_fakerPool.TryTake(out var faker))
+                                {
+                                    faker = InvoiceFakerFactory.Create(SettingsWithThreadSeed(Settings));
+                                }
+
                                 try
                                 {
-                                    var inv = faker.Generate();
-                                    var nr = Interlocked.Increment(ref _invoiceCounter);
-                                    inv.InvoiceNumber = MakeInvoiceNumber(nr);
-
-                                    // I/O-Throttling mit SemaphoreSlim
-                                    _ioGate.Wait();
-                                    try
+                                    for (var i = range.Item1; i < range.Item2; i++)
                                     {
-                                        SaveInvoiceFast(inv, useNow: false, saveJson: useJson);
-                                    }
-                                    finally
-                                    {
-                                        _ioGate.Release();
-                                    }
+                                        try
+                                        {
+                                            var inv = faker.Generate();
+                                            var nr = Interlocked.Increment(ref _invoiceCounter);
+                                            inv.InvoiceNumber = MakeInvoiceNumber(nr);
 
-                                    var step = Interlocked.Increment(ref progress);
-
-                                    // Optimierung: Weniger häufige UI-Updates (alle 128 statt 64)
-                                    if ((step & 0x7F) == 0)
-                                    {
-                                        task.Value = step;
-                                        var elapsed = sw.Elapsed.TotalSeconds;
-                                        var rate = step / elapsed;
-                                        task.Description = $"[cyan]{L.T("Generating invoices")}[/] [grey]{step}/{count}[/] [yellow]({rate:F0}/s)[/]";
+                                            // Schreibe in Channel (async warten wenn voll)
+                                            await channel.Writer.WriteAsync(inv, ct);
+                                        }
+                                        catch
+                                        {
+                                            Interlocked.Increment(ref errors);
+                                        }
                                     }
                                 }
-                                catch (Exception)
+                                finally
                                 {
-                                    Interlocked.Increment(ref errors);
+                                    if (_fakerPool.Count < MaxFakerPoolSize)
+                                    {
+                                        _fakerPool.Add(faker);
+                                    }
                                 }
+                            });
+                    }
+                    finally
+                    {
+                        channel.Writer.Complete();
+                    }
+                });
+
+                // Consumer: Schreibe Invoices mit async I/O (parallel)
+                var writerCount = Math.Max(4, threadCount / 2);
+                var consumerTasks = Enumerable.Range(0, writerCount).Select(async _ =>
+                {
+                    await foreach (var inv in channel.Reader.ReadAllAsync())
+                    {
+                        try
+                        {
+                            await SaveInvoiceFastAsync(inv, useNow: false, saveJson: useJson);
+
+                            var step = Interlocked.Increment(ref progress);
+
+                            // Update UI alle 64 Items
+                            if ((step & 0x3F) == 0)
+                            {
+                                task.Value = step;
+                                var elapsed = sw.Elapsed;
+                                var overallRate = step / elapsed.TotalSeconds;
+
+                                var timeSinceLastUpdate = (elapsed - lastUpdateTime).TotalSeconds;
+                                var itemsSinceLastUpdate = step - lastUpdateCount;
+                                var currentRate = timeSinceLastUpdate > 0
+                                    ? itemsSinceLastUpdate / timeSinceLastUpdate
+                                    : overallRate;
+
+                                lastUpdateTime = elapsed;
+                                lastUpdateCount = step;
+
+                                task.Description = $"[cyan]{L.T("Generating invoices")}[/] " +
+                                    $"[grey]{step:N0}/{count:N0}[/] " +
+                                    $"[yellow]⌀ {FormatThroughput(overallRate)}[/] " +
+                                    $"[green]⚡{FormatThroughput(currentRate)}[/]";
                             }
                         }
-                        finally
+                        catch
                         {
-                            _fakerPool.Add(faker);
+                            Interlocked.Increment(ref errors);
                         }
-                    });
+                    }
+                }).ToArray();
+
+                // Warte auf Producer und alle Consumer
+                await producerTask;
+                await Task.WhenAll(consumerTasks);
 
                 sw.Stop();
                 task.Value = count;
-                var totalRate = count / sw.Elapsed.TotalSeconds;
-                task.Description = $"[green]SUCCESS: {L.T("All invoices generated.")}[/] [grey]{count} files in {sw.Elapsed.TotalSeconds:F1}s[/] [yellow]({totalRate:F0}/s)[/]";
+                var finalRate = count / sw.Elapsed.TotalSeconds;
+                task.Description = $"[green]SUCCESS: {L.T("All invoices generated.")}[/] " +
+                    $"[grey]{count:N0} files in {FormatElapsedTime(sw.Elapsed)}[/] " +
+                    $"[yellow]{FormatThroughput(finalRate)}[/]";
             });
 
-        // Success Panel
+        var avgTimePerInvoice = sw.Elapsed.TotalMilliseconds / count;
         var resultPanel = new Panel(
             Align.Left(new Markup(
                 $"[green]STATUS: {L.T("All invoices generated.")}[/]\n" +
-                $"[grey]Files:[/]     [cyan]{count}[/]\n" +
-                $"[grey]Time:[/]      [yellow]{sw.Elapsed.TotalSeconds:F1}s[/]\n" +
-                $"[grey]Speed:[/]     [yellow]{count / sw.Elapsed.TotalSeconds:F0} invoices/s[/]" +
-                (errors > 0 ? $"\n[grey]Errors:[/]    [red]{errors}[/]" : ""))))
+                $"[grey]Files:[/]          [cyan]{count:N0}[/]\n" +
+                $"[grey]Time:[/]           [yellow]{FormatElapsedTime(sw.Elapsed)}[/]\n" +
+                $"[grey]Throughput:[/]     [yellow]{FormatThroughput(count / sw.Elapsed.TotalSeconds)}[/]\n" +
+                $"[grey]Avg per invoice:[/] [yellow]{avgTimePerInvoice:F2}ms[/]\n" +
+                $"[grey]Threads used:[/]   [cyan]{threadCount}[/]" +
+                (errors > 0 ? $"\n[grey]Errors:[/]         [red]{errors}[/]" : ""))))
         {
             Header = new PanelHeader("[bold green]Generation Complete[/]", Justify.Left),
             Border = BoxBorder.Rounded,
@@ -870,6 +932,125 @@ internal partial class Program
 
         AnsiConsole.Write(resultPanel);
         Pause();
+    }
+
+    private static async Task SaveInvoiceFastAsync(Invoice inv, bool useNow, bool saveJson, bool pretty = false)
+    {
+        var xmlPath = Path.Combine(InvoiceFolder, $"Invoice_{inv.InvoiceNumber}_{inv.IssueDate:yyyyMMdd}.xml");
+
+        var estimatedSize = inv.Items.Count * 256;
+        var bufferSize = Math.Clamp(estimatedSize, 32 * 1024, 256 * 1024);
+        var shouldPrettyPrint = pretty || Settings.PrettyPrintXml;
+
+        await using (var fs = new FileStream(xmlPath, new FileStreamOptions
+        {
+            Access = FileAccess.Write,
+            Mode = FileMode.Create,
+            Share = FileShare.Read,
+            Options = FileOptions.SequentialScan | FileOptions.Asynchronous,
+            BufferSize = bufferSize,
+            PreallocationSize = bufferSize
+        }))
+        {
+            await using var xw = XmlWriter.Create(fs, shouldPrettyPrint ? XmlPretty : XmlFast);
+            await WriteInvoiceXmlAsync(inv, xw);
+            await xw.FlushAsync();
+        }
+
+        if (saveJson)
+        {
+            var jsonPath = Path.ChangeExtension(xmlPath, ".json");
+            await using var jfs = new FileStream(jsonPath, new FileStreamOptions
+            {
+                Access = FileAccess.Write,
+                Mode = FileMode.Create,
+                Share = FileShare.Read,
+                Options = FileOptions.SequentialScan | FileOptions.Asynchronous,
+                BufferSize = bufferSize / 2,
+                PreallocationSize = bufferSize / 2
+            });
+            await JsonSerializer.SerializeAsync(jfs, inv, AppJsonContext.Default.Invoice);
+        }
+
+        DateTime stamp;
+        if (useNow)
+        {
+            stamp = DateTime.Now;
+        }
+        else
+        {
+            var minutes = Random.Shared.NextInt64(0, 5L * 365 * 24 * 60);
+            stamp = DateTime.Now.AddMinutes(-minutes);
+        }
+
+        File.SetCreationTime(xmlPath, stamp);
+        File.SetLastWriteTime(xmlPath, stamp);
+
+        if (saveJson)
+        {
+            var jsonPath = Path.ChangeExtension(xmlPath, ".json");
+            File.SetCreationTime(jsonPath, stamp);
+            File.SetLastWriteTime(jsonPath, stamp);
+        }
+    }
+
+    private static async Task WriteInvoiceXmlAsync(Invoice inv, XmlWriter xw)
+    {
+        await xw.WriteStartDocumentAsync();
+        await xw.WriteStartElementAsync(null, "Invoice", null);
+
+        // Header
+        await xw.WriteElementStringAsync(null, "InvoiceNumber", null, inv.InvoiceNumber);
+        await xw.WriteElementStringAsync(null, "IssueDate", null, inv.IssueDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
+        await xw.WriteElementStringAsync(null, "DueDate", null, inv.DueDate?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) ?? "");
+        await xw.WriteElementStringAsync(null, "Currency", null, inv.Currency);
+        await xw.WriteElementStringAsync(null, "PaymentTerms", null, inv.PaymentTerms);
+
+        // Customer
+        await xw.WriteStartElementAsync(null, "Customer", null);
+        await xw.WriteElementStringAsync(null, "Name", null, inv.BillTo.Name);
+        await xw.WriteElementStringAsync(null, "Email", null, inv.BillTo.Email);
+
+        await xw.WriteStartElementAsync(null, "Address", null);
+        await xw.WriteElementStringAsync(null, "Street", null, inv.BillTo.Address.Street);
+        await xw.WriteElementStringAsync(null, "ZipCode", null, inv.BillTo.Address.ZipCode);
+        await xw.WriteElementStringAsync(null, "City", null, inv.BillTo.Address.City);
+        await xw.WriteElementStringAsync(null, "Country", null, inv.BillTo.Address.Country);
+        await xw.WriteEndElementAsync(); // Address
+        await xw.WriteEndElementAsync(); // Customer
+
+        // Financials
+        await xw.WriteStartElementAsync(null, "Financials", null);
+        await xw.WriteElementStringAsync(null, "Subtotal", null, inv.Subtotal.ToString(CultureInfo.InvariantCulture));
+        await xw.WriteElementStringAsync(null, "StandardTaxRate", null, inv.TaxRate.ToString(CultureInfo.InvariantCulture));
+        await xw.WriteElementStringAsync(null, "TaxAmount", null, inv.TaxAmount.ToString(CultureInfo.InvariantCulture));
+        await xw.WriteElementStringAsync(null, "Total", null, inv.Total.ToString(CultureInfo.InvariantCulture));
+        await xw.WriteElementStringAsync(null, "IBAN", null, inv.Iban);
+        await xw.WriteElementStringAsync(null, "BIC", null, inv.Bic);
+        await xw.WriteElementStringAsync(null, "VendorVAT", null, inv.VendorVatId);
+        await xw.WriteElementStringAsync(null, "CustomerVAT", null, inv.CustomerVatId);
+        await xw.WriteEndElementAsync(); // Financials
+
+        // Items (batch write für bessere Performance)
+        await xw.WriteStartElementAsync(null, "Items", null);
+        foreach (var li in inv.Items)
+        {
+            await xw.WriteStartElementAsync(null, "Item", null);
+            await xw.WriteElementStringAsync(null, "SKU", null, li.Sku);
+            await xw.WriteElementStringAsync(null, "Description", null, li.Description);
+            await xw.WriteElementStringAsync(null, "Quantity", null, li.Qty.ToString(CultureInfo.InvariantCulture));
+            await xw.WriteElementStringAsync(null, "UnitPrice", null, li.UnitPrice.ToString(CultureInfo.InvariantCulture));
+            await xw.WriteElementStringAsync(null, "VATRate", null, li.VatRate.ToString(CultureInfo.InvariantCulture));
+            await xw.WriteElementStringAsync(null, "LineTotal", null, li.LineTotal.ToString(CultureInfo.InvariantCulture));
+            await xw.WriteEndElementAsync(); // Item
+        }
+        await xw.WriteEndElementAsync(); // Items
+
+        // Notes
+        await xw.WriteElementStringAsync(null, "Notes", null, inv.Notes);
+
+        await xw.WriteEndElementAsync(); // Invoice
+        await xw.WriteEndDocumentAsync();
     }
 
     private static string MakeInvoiceNumber(int nr)
@@ -942,7 +1123,8 @@ internal partial class Program
                 var nr = Interlocked.Increment(ref _invoiceCounter);
                 inv.InvoiceNumber = MakeInvoiceNumber(nr);
 
-                SaveInvoiceFast(inv, useNow: true, saveJson: useJson);
+                SaveInvoiceFastAsync(inv, useNow: true, saveJson: useJson)
+                    .GetAwaiter().GetResult();
 
                 Thread.Sleep(300);
             });
@@ -967,7 +1149,7 @@ internal partial class Program
     {
         WriteIndented = false,
         DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.Never,
-        TypeInfoResolver = new DefaultJsonTypeInfoResolver()
+        TypeInfoResolver = AppJsonContext.Default
     };
 
     private static readonly XmlWriterSettings XmlFast = new()
@@ -975,7 +1157,7 @@ internal partial class Program
         Indent = false,
         OmitXmlDeclaration = false,
         Encoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
-        Async = false,
+        Async = true,
         NewLineHandling = NewLineHandling.None,
         CheckCharacters = false,
         CloseOutput = true,
@@ -989,133 +1171,9 @@ internal partial class Program
         NewLineOnAttributes = false,
         NewLineChars = "\n",
         Encoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
-        OmitXmlDeclaration = false
+        OmitXmlDeclaration = false,
+        Async = true
     };
-
-    private static void SaveInvoiceFast(Invoice inv, bool useNow, bool saveJson, bool pretty = false)
-    {
-        var xmlPath = Path.Combine(InvoiceFolder, $"Invoice_{inv.InvoiceNumber}_{inv.IssueDate:yyyyMMdd}.xml");
-
-        // Optimiert: Dynamische Buffer-Größe basierend auf Item-Anzahl
-        var estimatedSize = inv.Items.Count * 256; // ~256 bytes pro Item
-        var bufferSize = Math.Clamp(estimatedSize, 32 * 1024, 256 * 1024); // 32KB - 256KB
-
-        // Verwende PrettyPrintXml aus Settings wenn nicht explizit überschrieben
-        var shouldPrettyPrint = pretty || Settings.PrettyPrintXml;
-
-        using (var fs = new FileStream(xmlPath, new FileStreamOptions
-        {
-            Access = FileAccess.Write,
-            Mode = FileMode.Create,
-            Share = FileShare.Read,
-            Options = FileOptions.SequentialScan | FileOptions.WriteThrough,
-            BufferSize = bufferSize,
-            PreallocationSize = bufferSize
-        }))
-        using (var xw = XmlWriter.Create(fs, shouldPrettyPrint ? XmlPretty : XmlFast))
-        {
-            WriteInvoiceXml(inv, xw);
-        }
-
-        if (saveJson)
-        {
-            var jsonPath = Path.ChangeExtension(xmlPath, ".json");
-            using var jfs = new FileStream(jsonPath, new FileStreamOptions
-            {
-                Access = FileAccess.Write,
-                Mode = FileMode.Create,
-                Share = FileShare.Read,
-                Options = FileOptions.SequentialScan | FileOptions.WriteThrough,
-                BufferSize = bufferSize / 2,
-                PreallocationSize = bufferSize / 2
-            });
-            JsonSerializer.Serialize(jfs, inv, JsonOpts);
-        }
-
-        // Timestamp-Handling optimiert
-        DateTime stamp;
-        if (useNow)
-        {
-            stamp = DateTime.Now;
-        }
-        else
-        {
-            var minutes = Random.Shared.NextInt64(0, 5L * 365 * 24 * 60);
-            stamp = DateTime.Now.AddMinutes(-minutes);
-        }
-
-        // Batch-Update der Timestamps (nur einmal pro Datei)
-        File.SetCreationTime(xmlPath, stamp);
-        File.SetLastWriteTime(xmlPath, stamp);
-
-        if (saveJson)
-        {
-            var jsonPath = Path.ChangeExtension(xmlPath, ".json");
-            File.SetCreationTime(jsonPath, stamp);
-            File.SetLastWriteTime(jsonPath, stamp);
-        }
-    }
-
-    // Schreiblogik: minimal sauberer, WriteElementString wo’s geht.
-    // Datums- und Zahlenformatierung strikt invariant, damit Parser nicht die Krise kriegen.
-    private static void WriteInvoiceXml(Invoice inv, XmlWriter xw)
-    {
-        xw.WriteStartDocument();
-        xw.WriteStartElement("Invoice");
-
-        // Header
-        xw.WriteElementString("InvoiceNumber", inv.InvoiceNumber);
-        xw.WriteElementString("IssueDate", inv.IssueDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
-        xw.WriteElementString("DueDate", inv.DueDate?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) ?? "");
-        xw.WriteElementString("Currency", inv.Currency);
-        xw.WriteElementString("PaymentTerms", inv.PaymentTerms);
-
-        // Customer
-        xw.WriteStartElement("Customer");
-        xw.WriteElementString("Name", inv.BillTo.Name);
-        xw.WriteElementString("Email", inv.BillTo.Email);
-
-        xw.WriteStartElement("Address");
-        xw.WriteElementString("Street", inv.BillTo.Address.Street);
-        xw.WriteElementString("ZipCode", inv.BillTo.Address.ZipCode);
-        xw.WriteElementString("City", inv.BillTo.Address.City);
-        xw.WriteElementString("Country", inv.BillTo.Address.Country);
-        xw.WriteEndElement(); // Address
-        xw.WriteEndElement(); // Customer
-
-        // Financials
-        xw.WriteStartElement("Financials");
-        xw.WriteElementString("Subtotal", inv.Subtotal.ToString(CultureInfo.InvariantCulture));
-        xw.WriteElementString("StandardTaxRate", inv.TaxRate.ToString(CultureInfo.InvariantCulture));
-        xw.WriteElementString("TaxAmount", inv.TaxAmount.ToString(CultureInfo.InvariantCulture));
-        xw.WriteElementString("Total", inv.Total.ToString(CultureInfo.InvariantCulture));
-        xw.WriteElementString("IBAN", inv.Iban);
-        xw.WriteElementString("BIC", inv.Bic);
-        xw.WriteElementString("VendorVAT", inv.VendorVatId);
-        xw.WriteElementString("CustomerVAT", inv.CustomerVatId);
-        xw.WriteEndElement(); // Financials
-
-        // Items
-        xw.WriteStartElement("Items");
-        foreach (var li in inv.Items)
-        {
-            xw.WriteStartElement("Item");
-            xw.WriteElementString("SKU", li.Sku);
-            xw.WriteElementString("Description", li.Description);
-            xw.WriteElementString("Quantity", li.Qty.ToString(CultureInfo.InvariantCulture));
-            xw.WriteElementString("UnitPrice", li.UnitPrice.ToString(CultureInfo.InvariantCulture));
-            xw.WriteElementString("VATRate", li.VatRate.ToString(CultureInfo.InvariantCulture));
-            xw.WriteElementString("LineTotal", li.LineTotal.ToString(CultureInfo.InvariantCulture));
-            xw.WriteEndElement(); // Item
-        }
-        xw.WriteEndElement(); // Items
-
-        // Notes
-        xw.WriteElementString("Notes", inv.Notes);
-
-        xw.WriteEndElement();   // Invoice
-        xw.WriteEndDocument();
-    }
 
     // ---------- CSV / Search / Stats ----------
     private static void ExportCsv()
@@ -1143,48 +1201,58 @@ internal partial class Program
 
         var lines = new ConcurrentBag<string>();
         var processed = 0;
+        long totalBytesRead = 0;
 
         AnsiConsole.Status()
             .Spinner(Spinner.Known.Dots)
             .SpinnerStyle(Style.Parse("yellow"))
-            .Start($"[yellow]Scanning {files.Length} invoices...[/]", ctx =>
+            .Start($"[yellow]Scanning {files.Length:N0} invoices...[/]", ctx =>
             {
                 var partitioner = Partitioner.Create(files, EnumerablePartitionerOptions.NoBuffering);
 
                 Parallel.ForEach(partitioner,
                     new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
-                    f =>
+                f =>
+                {
+                    try
                     {
-                        try
+                        var fileInfo = new FileInfo(f);
+                        Interlocked.Add(ref totalBytesRead, fileInfo.Length);
+
+                        var doc = XDocument.Load(f, LoadOptions.None);
+                        var root = doc.Root;
+                        if (root == null)
                         {
-                            var doc = XDocument.Load(f, LoadOptions.None);
-                            var root = doc.Root;
-                            if (root == null)
-                            {
-                                return;
-                            }
-
-                            var invNo = root.Element("InvoiceNumber")?.Value ?? "";
-                            var issue = root.Element("IssueDate")?.Value ?? "";
-                            var due = root.Element("DueDate")?.Value ?? "";
-                            var cust = root.Element("Customer")?.Element("Name")?.Value ?? "";
-                            var currency = root.Element("Currency")?.Value ?? "";
-                            var financials = root.Element("Financials");
-                            var subtotal = financials?.Element("Subtotal")?.Value ?? "0";
-                            var tax = financials?.Element("TaxAmount")?.Value ?? "0";
-                            var total = financials?.Element("Total")?.Value ?? "0";
-
-                            var line = $"{invNo},{issue},{due},{EscapeCsv(cust)},{subtotal},{tax},{total},{currency}";
-                            lines.Add(line);
-
-                            var count = Interlocked.Increment(ref processed);
-                            if ((count & 0x3F) == 0)
-                            {
-                                ctx.Status($"[yellow]Processed {count}/{files.Length} invoices...[/]");
-                            }
+                            return;
                         }
-                        catch { /* ignore */ }
-                    });
+
+                        var invNo = root.Element("InvoiceNumber")?.Value ?? "";
+                        var issue = root.Element("IssueDate")?.Value ?? "";
+                        var due = root.Element("DueDate")?.Value ?? "";
+                        var cust = root.Element("Customer")?.Element("Name")?.Value ?? "";
+                        var currency = root.Element("Currency")?.Value ?? "";
+                        var financials = root.Element("Financials");
+                        var subtotal = financials?.Element("Subtotal")?.Value ?? "0";
+                        var tax = financials?.Element("TaxAmount")?.Value ?? "0";
+                        var total = financials?.Element("Total")?.Value ?? "0";
+
+                        var line = $"{invNo},{issue},{due},{EscapeCsv(cust)},{subtotal},{tax},{total},{currency}";
+                        lines.Add(line);
+
+                        var count = Interlocked.Increment(ref processed);
+                        if ((count & 0x3F) == 0)
+                        {
+                            var elapsed = sw.Elapsed.TotalSeconds;
+                            var rate = count / elapsed;
+                            var mbRead = totalBytesRead / 1024.0 / 1024.0;
+                            var mbPerSec = mbRead / elapsed;
+
+                            ctx.Status($"[yellow]Processed {count:N0}/{files.Length:N0}[/] " +
+                                      $"[grey]({FormatThroughput(rate)}, {mbPerSec:F1} MB/s)[/]");
+                        }
+                    }
+                    catch { /* ignore */ }
+                });
 
                 ctx.Status($"[green]Writing CSV file...[/]");
             });
@@ -1208,15 +1276,18 @@ internal partial class Program
 
         sw.Stop();
         var rate = files.Length / sw.Elapsed.TotalSeconds;
+        var mbProcessed = totalBytesRead / 1024.0 / 1024.0;
+        var mbPerSec = mbProcessed / sw.Elapsed.TotalSeconds;
 
         var resultPanel = new Panel(
             Align.Left(new Markup(
                 $"[green]STATUS: CSV exported successfully[/]\n" +
-                $"[grey]File:[/]     [cyan]{Path.GetFileName(csvPath)}[/]\n" +
-                $"[grey]Invoices:[/] [yellow]{files.Length}[/]\n" +
-                $"[grey]Time:[/]     [yellow]{sw.Elapsed.TotalSeconds:F1}s[/]\n" +
-                $"[grey]Speed:[/]    [yellow]{rate:F0} invoices/s[/]\n" +
-                $"[grey]Path:[/]     [blue]{csvPath}[/]")))
+                $"[grey]File:[/]          [cyan]{Path.GetFileName(csvPath)}[/]\n" +
+                $"[grey]Invoices:[/]      [yellow]{files.Length:N0}[/]\n" +
+                $"[grey]Data processed:[/] [yellow]{mbProcessed:F2} MB[/]\n" +
+                $"[grey]Time:[/]          [yellow]{FormatElapsedTime(sw.Elapsed)}[/]\n" +
+                $"[grey]Throughput:[/]    [yellow]{FormatThroughput(rate)} ({mbPerSec:F1} MB/s)[/]\n" +
+                $"[grey]Path:[/]          [blue]{csvPath}[/]")))
         {
             Header = new PanelHeader("[bold green]Export Complete[/]", Justify.Left),
             Border = BoxBorder.Rounded,
@@ -1233,7 +1304,7 @@ internal partial class Program
         AnsiConsole.Write(new Rule("[bold red]Delete All Invoices[/]").LeftJustified());
         AnsiConsole.WriteLine();
 
-        var files = Directory.GetFiles(InvoiceFolder, "*");
+        var files = Directory.EnumerateFiles(InvoiceFolder, "*").ToArray();
         if (files.Length == 0)
         {
             var emptyPanel = new Panel("[yellow]No invoices found to delete[/]")
@@ -1271,52 +1342,73 @@ internal partial class Program
 
         var deleted = 0;
         var errors = 0;
+        var sw = Stopwatch.StartNew();
 
         AnsiConsole.Progress()
             .AutoClear(false)
             .Columns(
             [
                 new TaskDescriptionColumn(),
-                new ProgressBarColumn()
-                {
-                    CompletedStyle = new Style(Color.Red),
-                    RemainingStyle = new Style(Color.Grey23)
-                },
-                new PercentageColumn() { Style = new Style(Color.Red) },
-                new SpinnerColumn(Spinner.Known.Dots) { Style = new Style(Color.Red) },
+            new ProgressBarColumn()
+            {
+                CompletedStyle = new Style(Color.Red),
+                RemainingStyle = new Style(Color.Grey23)
+            },
+            new PercentageColumn() { Style = new Style(Color.Red) },
+            new RemainingTimeColumn() { Style = new Style(Color.Yellow) },
+            new SpinnerColumn(Spinner.Known.Dots) { Style = new Style(Color.Red) },
             ])
             .Start(ctx =>
             {
                 var task = ctx.AddTask($"[red]{L.T("Delete invoices")}[/]", new ProgressTaskSettings { MaxValue = files.Length });
 
-                Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, file =>
-                {
-                    try
-                    {
-                        File.Delete(file);
-                        var current = Interlocked.Increment(ref deleted);
+                // Optimiert: Partitioner für besseres Load-Balancing
+                var batchSize = Math.Max(16, files.Length / (Environment.ProcessorCount * 4));
+                var partitioner = Partitioner.Create(0, files.Length, batchSize);
 
-                        if ((current & 0x3F) == 0)
+                Parallel.ForEach(
+                    partitioner,
+                    new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
+                    range =>
+                    {
+                        // Batch-weise löschen für bessere Cache-Locality
+                        for (var i = range.Item1; i < range.Item2; i++)
                         {
-                            task.Value = current;
-                            task.Description = $"[red]Deleting[/] [grey]{current}/{files.Length}[/]";
-                        }
-                    }
-                    catch (Exception)
-                    {
-                        Interlocked.Increment(ref errors);
-                    }
-                });
+                            try
+                            {
+                                File.Delete(files[i]);
+                                var current = Interlocked.Increment(ref deleted);
 
+                                // Weniger häufige UI-Updates (alle 128 statt 64)
+                                if ((current & 0x7F) == 0)
+                                {
+                                    task.Value = current;
+                                    var rate = current / sw.Elapsed.TotalSeconds;
+                                    task.Description = $"[red]Deleting[/] [grey]{current:N0}/{files.Length:N0}[/] " +
+                                                     $"[yellow]{FormatThroughput(rate)}[/]";
+                                }
+                            }
+                            catch
+                            {
+                                Interlocked.Increment(ref errors);
+                            }
+                        }
+                    });
+
+                sw.Stop();
                 task.Value = files.Length;
-                task.Description = $"[green]Deletion complete[/] [grey]{deleted} deleted, {errors} errors[/]";
+                var finalRate = files.Length / sw.Elapsed.TotalSeconds;
+                task.Description = $"[green]Deletion complete[/] [grey]{deleted:N0} deleted in {FormatElapsedTime(sw.Elapsed)}[/] " +
+                                 $"[yellow]{FormatThroughput(finalRate)}[/]";
             });
 
         var resultPanel = new Panel(
             Align.Left(new Markup(
                 $"[green]STATUS: {L.T("All invoices have been deleted.")}[/]\n" +
-                $"[grey]Deleted:[/] [cyan]{deleted}[/]\n" +
-                (errors > 0 ? $"[grey]Errors:[/]  [red]{errors}[/]" : "[grey]Errors:[/]  [green]0[/]"))))
+                $"[grey]Deleted:[/]      [cyan]{deleted:N0}[/]\n" +
+                $"[grey]Time:[/]         [yellow]{FormatElapsedTime(sw.Elapsed)}[/]\n" +
+                $"[grey]Throughput:[/]   [yellow]{FormatThroughput(deleted / sw.Elapsed.TotalSeconds)}[/]\n" +
+                (errors > 0 ? $"[grey]Errors:[/]       [red]{errors}[/]" : ""))))
         {
             Header = new PanelHeader("[bold green]Deletion Complete[/]", Justify.Left),
             Border = BoxBorder.Rounded,
@@ -1810,6 +1902,41 @@ internal partial class Program
     // ===================================
     // UTILS
     // ===================================
+    private static string FormatElapsedTime(TimeSpan elapsed)
+    {
+        if (elapsed.TotalMilliseconds < 1000)
+        {
+            return $"{elapsed.TotalMilliseconds:F0}ms";
+        }
+
+        if (elapsed.TotalSeconds < 60)
+        {
+            return $"{elapsed.TotalSeconds:F2}s";
+        }
+
+        if (elapsed.TotalMinutes < 60)
+        {
+            return $"{elapsed.Minutes:D2}:{elapsed.Seconds:D2}min";
+        }
+
+        return $"{(int)elapsed.TotalHours:D2}:{elapsed.Minutes:D2}:{elapsed.Seconds:D2}h";
+    }
+
+    private static string FormatThroughput(double itemsPerSecond)
+    {
+        if (itemsPerSecond < 1)
+        {
+            return $"{itemsPerSecond * 60:F1} items/min";
+        }
+
+        if (itemsPerSecond < 1000)
+        {
+            return $"{itemsPerSecond:F1} items/s";
+        }
+
+        return $"{itemsPerSecond / 1000:F2}k items/s";
+    }
+
     private static decimal Dec(string? v)
     {
         if (string.IsNullOrWhiteSpace(v))
@@ -2084,4 +2211,49 @@ internal partial class Program
 
     [GeneratedRegex(@"^\[.*?\]\s*\S+\s*")]
     private static partial System.Text.RegularExpressions.Regex LogLinePrefixRegex();
+
+    // Alternative: Batch-Schreiber der mehrere Invoices buffered
+    private sealed class BatchedInvoiceWriter(string folder, bool saveJson, int batchSize = 16) : IAsyncDisposable
+    {
+        private readonly string _folder = folder;
+        private readonly bool _saveJson = saveJson;
+        private readonly int _batchSize = batchSize;
+        private readonly List<Invoice> _buffer = new(batchSize);
+        private readonly SemaphoreSlim _writeLock = new(1, 1);
+
+        public async Task WriteAsync(Invoice invoice)
+        {
+            await _writeLock.WaitAsync();
+            try
+            {
+                _buffer.Add(invoice);
+                if (_buffer.Count >= _batchSize)
+                {
+                    await FlushAsync();
+                }
+            }
+            finally
+            {
+                _writeLock.Release();
+            }
+        }
+
+        private async Task FlushAsync()
+        {
+            if (_buffer.Count == 0)
+            {
+                return;
+            }
+
+            var tasks = _buffer.Select(inv => SaveInvoiceFastAsync(inv, false, _saveJson)).ToArray();
+            await Task.WhenAll(tasks);
+            _buffer.Clear();
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            await FlushAsync();
+            _writeLock.Dispose();
+        }
+    }
 }
